@@ -1,6 +1,6 @@
 from jupyterhub.auth import Authenticator
 from jupyterhub.utils import url_path_join
-from traitlets import Bool, Set, default, observe
+from traitlets import Bool, Set, default, observe, Unicode
 from jupyterhub.traitlets import Command
 import sys
 from shutil import which
@@ -10,6 +10,7 @@ import pipes
 import pwd
 from tornado import gen
 from jupyterhub.handlers import BaseHandler
+import pamela
 
 
 class MyLoginHandler(BaseHandler):
@@ -169,4 +170,67 @@ class MyLocalAuthenticator(MyAuthenticator):
 
 class MyPAM(MyLocalAuthenticator):
     """Default PAMAuthenticator"""
-    pass
+
+    encoding = Unicode('utf8',
+                       help="""
+           The text encoding to use when communicating with PAM
+           """
+                       ).tag(config=True)
+
+    service = Unicode('login',
+                      help="""
+           The name of the PAM service to use for authentication
+           """
+                      ).tag(config=True)
+
+    open_sessions = Bool(True,
+                         help="""
+           Whether to open a new PAM session when spawners are started.
+
+           This may trigger things like mounting shared filsystems,
+           loading credentials, etc. depending on system configuration,
+           but it does not always work.
+
+           If any errors are encountered when opening/closing PAM sessions,
+           this is automatically set to False.
+           """
+                         ).tag(config=True)
+
+    @gen.coroutine
+    def authenticate(self, handler, data):
+        """Authenticate with PAM, and return the username if login is successful.
+
+        Return None otherwise.
+        """
+        username = data['username']
+        try:
+            pamela.authenticate(username, data['password'], service=self.service)
+        except pamela.PAMError as e:
+            if handler is not None:
+                self.log.warning("PAM Authentication failed (%s@%s): %s", username, handler.request.remote_ip, e)
+            else:
+                self.log.warning("PAM Authentication failed: %s", e)
+        else:
+            return username
+
+    def pre_spawn_start(self, user, spawner):
+        """Open PAM session for user if so configured"""
+        if not self.open_sessions:
+            return
+        try:
+            pamela.open_session(user.name, service=self.service)
+        except pamela.PAMError as e:
+            self.log.warning("Failed to open PAM session for %s: %s", user.name, e)
+            self.log.warning("Disabling PAM sessions from now on.")
+            self.open_sessions = False
+
+    def post_spawn_stop(self, user, spawner):
+        """Close PAM session for user if we were configured to opened one"""
+        if not self.open_sessions:
+            return
+        try:
+            pamela.close_session(user.name, service=self.service)
+        except pamela.PAMError as e:
+            self.log.warning("Failed to close PAM session for %s: %s", user.name, e)
+            self.log.warning("Disabling PAM sessions from now on.")
+            self.open_sessions = False
